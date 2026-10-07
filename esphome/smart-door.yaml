@@ -1,0 +1,1113 @@
+# =========================================================================
+#  Объединённый конфиг: ESP32-S3-WROOM-1U-N16 (своя PCB)
+#  - hlk_fm22x        : распознавание лиц (UART)
+#  - fingerprint_sfm   : сенсор отпечатков SFM v1.7 (UART)
+#  - gimdow_ble        : замок Gimdow A1 Ultra (BLE, без пинов)
+#  - ST7789 240x240    : SPI-дисплей вместо RGB-панели из исходника
+#
+#  ЛОГИКА РЕГИСТРАЦИИ:
+#   1. Вводим имя в "Имя для нового лица", жмём "Start Face Enrollment".
+#      После успешной регистрации ESP присваивает лицу ID — он сразу
+#      подставляется в "ID пользователя для отпечатка" (target_user_id),
+#      а "Палец пользователя (1-3)" сбрасывается в 1.
+#   2. Жмём "Зарегистрировать отпечаток для пользователя" — прикладываем
+#      палец. ID отпечатка вычисляется как (ID_пользователя-1)*3 + номер
+#      пальца — так по совпавшему отпечатку однозначно вычисляется
+#      владелец, без отдельной таблицы соответствий. После удачной
+#      записи "Палец" автоматически +1 (до 3 пальцев на пользователя).
+#   3. Для привязки отпечатка к УЖЕ существующему пользователю (не только
+#      только что зарегистрированному) — выберите его в select
+#      "Пользователь (для привязки отпечатка)" (список "ID: имя",
+#      обновляется автоматически) вместо ручного ввода ID.
+#
+#  ЛОГИКА РАБОТЫ (2FA, лицо -> палец):
+#   - Касание пальцем сенсора в режиме ожидания запускает СКАН ЛИЦА
+#     (а не сразу проверку отпечатка).
+#   - Если лицо распознано — устройство 15 секунд ждёт повторное касание
+#     пальцем. Статус и экран показывают "2FA: приложите палец".
+#   - Повторное касание сверяет отпечаток. Если он принадлежит ТОМУ ЖЕ
+#     пользователю, что и распознанное лицо (см. формулу выше) — замок
+#     открывается. Если отпечаток чужой/не распознан/истекло время —
+#     доступ отклоняется, состояние сбрасывается в ожидание.
+#   - Кнопки "Face scan" и "Fingerprint scan" дублируют триггеры вручную
+#     (полезно для тестирования сценария по шагам).
+#   - На экране во время сценария 2FA вместо обычного дашборда показываются
+#     крупные иконки (лицо с пульсирующей рамкой -> галочка "найдено" ->
+#     иконка пальца с ожиданием -> зелёная галочка/красный крест на итог).
+#     Это не настоящий GIF (ESPHome его не умеет), а простая векторная
+#     анимация примитивами display API, но выглядит похоже.
+#
+#  КАРТА ПИНОВ — по факту разведённой плате (ESP32-S3-WROOM-1U-N16,
+#  своя PCB в EasyEDA, не DevKitC-1). Strapping-пины IO0/IO3/IO45/IO46
+#  проверены по схеме — никуда не подключены, конфликтов нет.
+#
+#    UART "лицо" (FM22x)     tx=GPIO39  rx=GPIO40 (проверено на железе;
+#                            обратное тому, что подсказывали имена сетей)
+#    UART "отпечаток" (SFM)  tx=GPIO17 (сеть RX)        rx=GPIO18 (сеть TX)
+#    Отпечаток IRQ           GPIO9   (sensing_pin)
+#    Отпечаток power         GPIO6 (обязателен для компонента, но физически
+#                            не подключён — CN1 запитан статически от VCC_3)
+#    SPI дисплея             clk(SCL)=GPIO41  mosi(SDA)=GPIO42
+#    Дисплей RES/DC          reset=GPIO4  dc=GPIO14
+#    Подсветка (LEDC, BLK)   GPIO5
+#    Дисплей CS              не разведён физически (модуль без CS) и в
+#                            mipi_spi это опциональный параметр — просто
+#                            не указан в конфиге, GPIO2 свободен
+#
+#  Важно про направление UART: имя сети = имя пина НА САМОМ УСТРОЙСТВЕ
+#  (FM22x/SFM), поэтому "UART_RX"/"RX" — это вход устройства и в ESPHome
+#  это tx_pin платы, а "UART_TX"/"TX" — выход устройства → rx_pin платы.
+#
+#  Проверьте на своём модуле ST7789: возможно потребуется поправить
+#  invert_colors / color_order (для 240x240 ST7789 с aliexpress почти
+#  всегда нужен invert_colors: true — уже включено ниже).
+# =========================================================================
+
+substitutions:
+  step_pause: 3s
+  # Gimdow A1 Ultra — см. инструкцию к исходному fingerprint-sfm.yaml
+  gimdow_local_key: !secret gimdow_local_key
+  gimdow_mac: !secret gimdow_mac
+  gimdow_uuid: !secret gimdow_uuid
+  gimdow_device_id: !secret gimdow_device_id
+  gimdow_ble_unlock_check: !secret gimdow_ble_unlock_check
+
+esphome:
+  name: smart-door
+  friendly_name: Smart Door
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: display_autooff
+      - text_sensor.template.publish:
+          id: fp_status
+          state: "Smart Lock"
+
+esp32:
+  # Своя плата на голом модуле ESP32-S3-WROOM-1U-N16 (не DevKitC-1),
+  # но board: esp32-s3-devkitc-1 использует тот же чип/флеш и отлично
+  # подходит как generic-профиль для WROOM-1U-N16 (16MB flash, без PSRAM).
+  board: esp32-s3-devkitc-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  # Лог на нативный USB (Type-C) — UART0 не занимаем, он не нужен,
+  # т.к. обе периферии сидят на UART1/UART2.
+  hardware_uart: USB_SERIAL_JTAG
+
+ota:
+  - platform: esphome
+    password: 388ed4e9cc9d4680ad894229cc2db045
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  # domain НЕ задаём: ".internal" требует свою DNS-инфраструктуру
+  # (split-horizon DNS в корпоративной сети). На обычной домашней сети
+  # без этого устройство доступно по стандартному mDNS как smart-door.local
+  ap:
+    ssid: "Smart-Door-Setup"
+    password: "ЗАМЕНИТЕ_НА_СВОЙ_ПАРОЛЬ"
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Europe/Moscow"
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: ${gimdow_mac}
+    id: gimdow_ble_client
+    auto_connect: false
+
+api:
+  actions:
+    - action: enroll
+      variables:
+        name: string
+        direction: int
+      then:
+        - hlk_fm22x.enroll:
+            name: !lambda 'return name;'
+            direction: !lambda 'return direction;'
+    - action: face_scan
+      then:
+        - hlk_fm22x.scan:
+    - action: face_delete
+      variables:
+        face_id: int
+      then:
+        - hlk_fm22x.delete:
+            face_id: !lambda 'return face_id;'
+        - script.execute:
+            id: remove_face_name
+            fid: !lambda 'return face_id;'
+    - action: face_delete_all
+      then:
+        - hlk_fm22x.delete_all:
+        - text.set:
+            id: face_names
+            value: ""
+    - action: face_reset
+      then:
+        - hlk_fm22x.reset:
+    - action: start_enrollment
+      variables:
+        user_name: string
+      then:
+        - script.execute:
+            id: start_enroll_script
+            user_name: !lambda 'return user_name;'
+
+# ------------------------------------------------------------------ UART
+uart:
+  - id: uart_face
+    # Проверено на реальном железе: несмотря на имена сетей на схеме,
+    # рабочее направление - tx=GPIO39, rx=GPIO40 (обратное тому, что
+    # подсказывала логика по именам нетов - на практике решает тест).
+    tx_pin: GPIO39
+    rx_pin: GPIO40
+    baud_rate: 115200
+  - id: uart_fp
+    # tx_pin платы -> сеть "RX" на CN1 (вход SFM); rx_pin платы -> сеть "TX" на CN1 (выход SFM)
+    tx_pin: GPIO17
+    rx_pin: GPIO18
+    baud_rate: 115200
+
+external_components:
+  - source: github://dvb6666/esphome-components
+    refresh: 1sec
+  - source: github://prokudin07/gimdow_ble@v2.1.0
+    components: [ gimdow_ble ]
+    refresh: 0s
+
+# ------------------------------------------------------------- Замок BLE
+lock:
+  - platform: gimdow_ble
+    name: "Front Door Lock"
+    id: gimdow_ultra
+    model: a1_ultra
+    ble_client_id: gimdow_ble_client
+    local_key: ${gimdow_local_key}
+    uuid: ${gimdow_uuid}
+    tuya_device_id: ${gimdow_device_id}
+    ble_unlock_check: ${gimdow_ble_unlock_check}
+    beep_volume:
+      name: "Gimdow Beep Volume"
+      entity_category: config
+    battery_level:
+      name: "Gimdow Battery Level"
+      entity_category: diagnostic
+    battery_critical:
+      name: "Gimdow Battery Critical"
+      entity_category: diagnostic
+
+# ----------------------------------------------------- Глобальные переменные
+globals:
+  - id: current_enroll_name
+    type: std::string
+  - id: current_step
+    type: int
+  - id: enroll_fails
+    type: int
+    initial_value: '0'
+  # --- Машина состояний 2FA (лицо -> палец) ---
+  # 0 = ожидание касания (палец на сенсоре запускает скан ЛИЦА)
+  # 1 = лицо распознано, ждём повторное касание пальцем для подтверждения
+  - id: auth_phase
+    type: int
+    initial_value: '0'
+  - id: pending_user_id
+    type: int
+    initial_value: '-1'
+  - id: last_touch_was_2fa
+    type: bool
+    initial_value: 'false'
+  # Иконка на экране: 0=нет(обычный дашборд) 1=скан лица 2=лицо найдено
+  # 3=ждём палец 4=успех(галочка) 5=отказ(крест)
+  - id: display_icon_state
+    type: int
+    initial_value: '0'
+
+# ------------------------------------------------------------------ Текст
+text:
+  - platform: template
+    name: "Имя для нового лица"
+    id: new_user_name
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 20
+    initial_value: ""
+  - platform: template
+    name: "Face Names"
+    id: face_names
+    icon: "mdi:account-details"
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 255
+    initial_value: ""
+
+# ------------------------------------------------------------------ Числа
+number:
+  - platform: template
+    name: "ID для удаления лица"
+    id: delete_user_id
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 1
+  - platform: template
+    name: "Display timeout"
+    id: display_timeout
+    unit_of_measurement: "s"
+    icon: mdi:timer-outline
+    entity_category: config
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    mode: box
+  # Заполняется автоматически ID только что зарегистрированного лица.
+  # Можно поменять и вручную (или через select ниже) для привязки отпечатков
+  # к другому, ранее зарегистрированному пользователю.
+  - platform: template
+    name: "ID пользователя для отпечатка"
+    id: target_user_id
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 1
+    on_value:
+      then:
+        - script.execute:
+            id: lookup_user_name
+            uid: !lambda 'return (int) x;'
+  # До 3 отпечатков на пользователя: 1..3. Сбрасывается в 1 при новой
+  # регистрации лица, автоматически увеличивается после каждого
+  # успешно записанного отпечатка.
+  - platform: template
+    name: "Палец пользователя (1-3)"
+    id: finger_index
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 3
+    step: 1
+    initial_value: 1
+
+select:
+  # Статичный список ID (динамическое изменение options в рантайме
+  # в текущих версиях ESPHome не поддерживается стабильно). Имя выбранного
+  # пользователя показывается отдельно в text_sensor "selected_user_name"
+  # ниже — обновляется автоматически при выборе.
+  - platform: template
+    id: user_select
+    name: "Пользователь (ID, для привязки отпечатка)"
+    optimistic: true
+    options:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "6"
+      - "7"
+      - "8"
+      - "9"
+      - "10"
+      - "11"
+      - "12"
+      - "13"
+      - "14"
+      - "15"
+      - "16"
+      - "17"
+      - "18"
+      - "19"
+      - "20"
+      - "21"
+      - "22"
+      - "23"
+      - "24"
+      - "25"
+      - "26"
+      - "27"
+      - "28"
+      - "29"
+      - "30"
+    initial_option: "1"
+    on_value:
+      then:
+        - number.set:
+            id: target_user_id
+            value: !lambda 'return atoi(x.c_str());'
+  - platform: template
+    id: color_start
+    name: "Color1 start"
+    optimistic: true
+    options: ["yellow", "purple", "red", "cyan", "green", "blue", "off"]
+    initial_option: "yellow"
+  - platform: template
+    id: color_end
+    name: "Color2 end"
+    optimistic: true
+    options: ["yellow", "purple", "red", "cyan", "green", "blue", "off"]
+    initial_option: "off"
+
+# ------------------------------------------------------------------ Скрипты
+script:
+  - id: start_enroll_script
+    parameters:
+      user_name: string
+    then:
+      - hlk_fm22x.reset:
+      - delay: 1s
+      - globals.set:
+          id: current_enroll_name
+          value: !lambda 'return user_name;'
+      - globals.set:
+          id: current_step
+          value: !lambda 'return 1;'
+      - globals.set:
+          id: enroll_fails
+          value: !lambda 'return 0;'
+      - lambda: 'id(enroll_instruction).publish_state("Смотрите ПРЯМО в камеру...");'
+      - delay: 500ms
+      - hlk_fm22x.enroll:
+          name: !lambda 'return user_name;'
+          direction: 1
+
+  - id: save_face_name
+    parameters:
+      fid: int
+      fname: string
+    then:
+      - lambda: |-
+          std::string old = id(face_names).state;
+          std::string key = std::to_string(fid) + "=";
+          std::string out;
+          size_t pos = 0;
+          while (pos < old.size()) {
+            size_t end = old.find(';', pos);
+            if (end == std::string::npos) end = old.size();
+            if (end > pos && old.compare(pos, key.size(), key) != 0) {
+              out += old.substr(pos, end - pos) + ";";
+            }
+            pos = end + 1;
+          }
+          out += key + fname + ";";
+          if (out.size() > 255) {
+            ESP_LOGW("face", "names list is full, cannot save name for id %d", (int) fid);
+            id(enroll_instruction).publish_state("Лицо сохранено, но список имён переполнен");
+          } else {
+            id(face_names).make_call().set_value(out).perform();
+          }
+
+  - id: remove_face_name
+    parameters:
+      fid: int
+    then:
+      - lambda: |-
+          std::string old = id(face_names).state;
+          std::string key = std::to_string(fid) + "=";
+          std::string out;
+          size_t pos = 0;
+          while (pos < old.size()) {
+            size_t end = old.find(';', pos);
+            if (end == std::string::npos) end = old.size();
+            if (end > pos && old.compare(pos, key.size(), key) != 0) {
+              out += old.substr(pos, end - pos) + ";";
+            }
+            pos = end + 1;
+          }
+          id(face_names).make_call().set_value(out).perform();
+
+  # По ID пользователя находит имя в face_names и публикует в text_sensor
+  # selected_user_name — вызывается автоматически при выборе в select/number.
+  - id: lookup_user_name
+    parameters:
+      uid: int
+    then:
+      - lambda: |-
+          std::string map = id(face_names).state;
+          std::string key = std::to_string(uid) + "=";
+          std::string found;
+          size_t pos = 0;
+          while (pos < map.size()) {
+            size_t end = map.find(';', pos);
+            if (end == std::string::npos) end = map.size();
+            if (map.compare(pos, key.size(), key) == 0) {
+              found = map.substr(pos + key.size(), end - pos - key.size());
+              break;
+            }
+            pos = end + 1;
+          }
+          id(selected_user_name).publish_state(found.empty() ? "(не найден)" : found);
+
+  # Автоотключение подсветки дисплея
+  - id: display_autooff
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(display_timeout).state > 0;'
+          then:
+            - delay: !lambda 'return (uint32_t)(id(display_timeout).state * 1000);'
+            - light.turn_off: backlight
+  - id: display_wake
+    then:
+      - light.turn_on: backlight
+      - script.execute: display_autooff
+  - id: reset_status
+    mode: restart
+    then:
+      - delay: 3s
+      - lambda: |-
+          id(display_icon_state) = 0;
+      - text_sensor.template.publish:
+          id: fp_status
+          state: "Smart Lock"
+
+  # Таймаут окна 2FA: если после распознанного лица палец не приложили
+  # вовремя — сбрасываем состояние обратно в режим ожидания.
+  - id: auth_timeout_reset
+    mode: restart
+    then:
+      - delay: 15s
+      - if:
+          condition:
+            lambda: 'return id(auth_phase) == 1;'
+          then:
+            - lambda: |-
+                id(auth_phase) = 0;
+                id(pending_user_id) = -1;
+                id(display_icon_state) = 0;
+            - text_sensor.template.publish:
+                id: fp_status
+                state: "Время ожидания 2FA истекло"
+            - script.execute: reset_status
+
+# --------------------------------------------------------- Модуль лиц HLK-FM22x
+hlk_fm22x:
+  id: my_fm223
+  uart_id: uart_face
+
+  on_face_scan_invalid:
+    - homeassistant.event:
+        event: esphome.face2_face_scan_invalid
+        data:
+          error: !lambda 'return error;'
+    - lambda: |-
+        id(last_face_name).publish_state("Ошибка сканирования (лицо не найдено)");
+        id(fp_status).publish_state("Лицо не найдено");
+        id(display_icon_state) = 5;
+        id(auth_phase) = 0;
+        id(pending_user_id) = -1;
+    - script.stop: auth_timeout_reset
+    - script.execute: reset_status
+
+  on_face_scan_matched:
+    - homeassistant.event:
+        event: esphome.face2_face_scan_matched
+        data:
+          face_id: !lambda 'return face_id;'
+          name: !lambda 'return name;'
+    - lambda: |-
+        std::string n(name.c_str());
+        std::string map = id(face_names).state;
+        std::string key = std::to_string(face_id) + "=";
+        std::string found;
+        size_t pos = 0;
+        while (pos < map.size()) {
+          size_t end = map.find(';', pos);
+          if (end == std::string::npos) end = map.size();
+          if (map.compare(pos, key.size(), key) == 0) {
+            found = map.substr(pos + key.size(), end - pos - key.size());
+            break;
+          }
+          pos = end + 1;
+        }
+        std::string label = !found.empty() ? found : (!n.empty() ? n : ("ID " + std::to_string(face_id)));
+        id(last_face_name).publish_state(label);
+        // Лицо распознано -> открываем окно ожидания подтверждения отпечатком (2FA)
+        id(auth_phase) = 1;
+        id(pending_user_id) = face_id;
+        id(display_icon_state) = 2;
+        id(fp_status).publish_state("Лицо: " + label + " - найдено!");
+    - delay: 1200ms
+    - lambda: |-
+        id(display_icon_state) = 3;
+        id(fp_status).publish_state("Приложите палец для подтверждения (2FA)");
+    - script.execute: auth_timeout_reset
+
+  on_face_scan_unmatched:
+    - homeassistant.event:
+        event: esphome.face2_face_scan_unmatched
+    - lambda: |-
+        id(last_face_name).publish_state("Неизвестное лицо");
+        id(fp_status).publish_state("Лицо не распознано");
+        id(display_icon_state) = 5;
+    - script.execute: reset_status
+
+  on_face_info:
+    - homeassistant.event:
+        event: esphome.face2_face_info
+        data:
+          status: !lambda 'return status;'
+          left: !lambda 'return left;'
+          top: !lambda 'return top;'
+          right: !lambda 'return right;'
+          bottom: !lambda 'return bottom;'
+          yaw: !lambda 'return yaw;'
+          pitch: !lambda 'return pitch;'
+          roll: !lambda 'return roll;'
+
+  on_enrollment_done:
+    - homeassistant.event:
+        event: esphome.face2_enrollment_done
+        data:
+          face_id: !lambda 'return face_id;'
+          direction: !lambda 'return direction;'
+    - lambda: |-
+        if (face_id >= 0) {
+          id(current_step) = 0;
+          id(enroll_instruction).publish_state("Лицо сохранено! ID " + std::to_string(face_id) + " (" + id(current_enroll_name) + ")");
+        } else if (id(current_step) == 1) {
+          id(current_step) = 2;
+          id(enroll_instruction).publish_state("Успешно! Теперь поверните голову ВПРАВО");
+        } else if (id(current_step) == 2) {
+          id(current_step) = 4;
+          id(enroll_instruction).publish_state("Успешно! Теперь поверните голову ВЛЕВО");
+        } else if (id(current_step) == 4) {
+          id(current_step) = 8;
+          id(enroll_instruction).publish_state("Успешно! Наклоните голову ВНИЗ");
+        } else if (id(current_step) == 8) {
+          id(current_step) = 16;
+          id(enroll_instruction).publish_state("Успешно! Поднимите голову ВВЕРХ");
+        } else if (id(current_step) == 16) {
+          id(current_step) = 0;
+          id(enroll_instruction).publish_state("НЕ сохранено: модуль не собрал все ракурсы. Нажмите старт ещё раз");
+        }
+    - if:
+        condition:
+          lambda: 'return face_id >= 0;'
+        then:
+          - script.execute:
+              id: save_face_name
+              fid: !lambda 'return face_id;'
+              fname: !lambda 'return id(current_enroll_name);'
+          - number.set:
+              id: target_user_id
+              value: !lambda 'return face_id;'
+          - number.set:
+              id: finger_index
+              value: 1
+          - lambda: |-
+              id(enroll_instruction).publish_state(
+                "Лицо сохранено! ID " + std::to_string(face_id) + " (" + id(current_enroll_name) +
+                "). Теперь зарегистрируйте отпечаток(и) — кнопка \"Зарегистрировать отпечаток для пользователя\"");
+    - if:
+        condition:
+          lambda: 'return id(current_step) > 0;'
+        then:
+          - delay: ${step_pause}
+          - hlk_fm22x.enroll:
+              name: !lambda 'return id(current_enroll_name);'
+              direction: !lambda 'return id(current_step);'
+
+  on_enrollment_failed:
+    - homeassistant.event:
+        event: esphome.face2_enrollment_failed
+        data:
+          error: !lambda 'return error;'
+    - if:
+        condition:
+          lambda: 'return id(current_step) > 0;'
+        then:
+          - lambda: |-
+              id(enroll_fails)++;
+              if (id(enroll_fails) > 5) {
+                id(current_step) = 0;
+                id(enroll_instruction).publish_state("Слишком много ошибок. Нажмите старт, когда будете готовы");
+              } else {
+                id(current_step) = 1;
+                id(enroll_instruction).publish_state("Не получилось. Начинаем заново: смотрите ПРЯМО в камеру...");
+              }
+          - if:
+              condition:
+                lambda: 'return id(current_step) > 0;'
+              then:
+                - delay: 2s
+                - hlk_fm22x.enroll:
+                    name: !lambda 'return id(current_enroll_name);'
+                    direction: 1
+
+# ------------------------------------------------------- Сенсор отпечатков
+fingerprint_sfm:
+  id: sfm_id
+  uart_id: uart_fp
+  # Компонент требует sensor_power_pin обязательно, но физически на плате
+  # его нет — CN1 запитан статически от VCC_3. Указываем незадействованный
+  # GPIO "для галочки" (никуда на плате не подключён, как и cs_pin дисплея).
+  sensor_power_pin: GPIO6
+  sensing_pin: GPIO9
+  error:
+    name: Error
+  fingerprint_count:
+    id: fp_count
+    name: "Fingerprints count"
+  last_finger_id:
+    name: "Last Fingerprint ID"
+    force_update: true
+  on_finger_scan_start:
+    - script.execute: display_wake
+    - fingerprint_sfm.set_color: blue
+    # Фиксируем назначение ИМЕННО этого сканирования в момент касания.
+    # false = первое касание (только запускает лицо); true = второй фактор.
+    - lambda: |-
+        id(last_touch_was_2fa) = (id(auth_phase) == 1);
+    - if:
+        condition:
+          lambda: 'return !id(last_touch_was_2fa);'
+        then:
+          - lambda: 'id(display_icon_state) = 1;'
+          - text_sensor.template.publish:
+              id: fp_status
+              state: "Касание. Сканируем лицо..."
+          - hlk_fm22x.scan:
+        else:
+          - text_sensor.template.publish:
+              id: fp_status
+              state: "Подтверждение отпечатком (2FA)..."
+
+  on_finger_scan_matched:
+    - script.execute: display_wake
+    - lambda: |-
+        int matched_uid = (finger_id - 1) / 3 + 1;
+        ESP_LOGI("auth", "Fingerprint OK: finger_id=%d -> user %d, role=%d, phase=%d, is_2fa=%d",
+                 finger_id, matched_uid, role, id(auth_phase), id(last_touch_was_2fa));
+
+        // Результат первого касания никогда не является вторым фактором,
+        // даже если распознавание лица завершилось раньше ответа SFM.
+        if (!id(last_touch_was_2fa)) {
+          ESP_LOGD("auth", "Ignoring fingerprint result from initial touch");
+          return;
+        }
+
+        // Второй scan действителен только пока открыто окно 2FA.
+        if (id(auth_phase) != 1) {
+          ESP_LOGW("auth", "2FA fingerprint received outside active auth window");
+          id(last_touch_was_2fa) = false;
+          return;
+        }
+
+        if (matched_uid == id(pending_user_id)) {
+          std::string map = id(face_names).state;
+          std::string key = std::to_string(matched_uid) + "=";
+          std::string found;
+          size_t pos = 0;
+          while (pos < map.size()) {
+            size_t end = map.find(';', pos);
+            if (end == std::string::npos) end = map.size();
+            if (map.compare(pos, key.size(), key) == 0) {
+              found = map.substr(pos + key.size(), end - pos - key.size());
+              break;
+            }
+            pos = end + 1;
+          }
+          std::string label = found.empty() ? ("ID " + std::to_string(matched_uid)) : found;
+          id(fp_status).publish_state("Добро пожаловать, " + label + "!");
+          id(display_icon_state) = 4;
+          id(sfm_id).set_color(fingerprint_sfm::GREEN, fingerprint_sfm::GREEN);
+          id(gimdow_ultra).unlock();
+        } else {
+          ESP_LOGW("auth", "2FA mismatch: face user=%d fingerprint user=%d",
+                   id(pending_user_id), matched_uid);
+          id(fp_status).publish_state("Отпечаток не подходит этому пользователю");
+          id(display_icon_state) = 5;
+          id(sfm_id).set_color(fingerprint_sfm::RED, fingerprint_sfm::RED);
+        }
+
+        id(auth_phase) = 0;
+        id(pending_user_id) = -1;
+    - if:
+        condition:
+          lambda: 'return id(last_touch_was_2fa);'
+        then:
+          - script.stop: auth_timeout_reset
+          - script.execute: reset_status
+    - lambda: 'id(last_touch_was_2fa) = false;'
+
+  on_finger_scan_unmatched:
+    - script.execute: display_wake
+    - if:
+        condition:
+          lambda: 'return id(last_touch_was_2fa);'
+        then:
+          - lambda: |-
+              id(fp_status).publish_state("Отпечаток не распознан (2FA)");
+              id(display_icon_state) = 5;
+              id(sfm_id).set_color(fingerprint_sfm::RED, fingerprint_sfm::RED);
+              id(auth_phase) = 0;
+              id(pending_user_id) = -1;
+          - script.stop: auth_timeout_reset
+          - script.execute: reset_status
+    - lambda: 'id(last_touch_was_2fa) = false;'
+
+  on_finger_scan_failed:
+    - script.execute: display_wake
+    - lambda: |-
+        ESP_LOGW("lambda", "Fingerprint scan failed, code %d", error_code);
+    - if:
+        condition:
+          lambda: 'return id(last_touch_was_2fa);'
+        then:
+          - lambda: |-
+              id(fp_status).publish_state("Ошибка сканирования, попробуйте ещё раз (2FA)");
+              id(display_icon_state) = 5;
+              id(auth_phase) = 0;
+              id(pending_user_id) = -1;
+          - script.stop: auth_timeout_reset
+          - script.execute: reset_status
+    - lambda: 'id(last_touch_was_2fa) = false;'
+
+  on_register_step_start:
+    - script.execute: display_wake
+    - fingerprint_sfm.set_color: !lambda "return step == 1 ? fingerprint_sfm::YELLOW : step == 2 ? fingerprint_sfm::PURPLE : fingerprint_sfm::BLUE;"
+    - text_sensor.template.publish:
+        id: fp_status
+        state: !lambda 'return "Register " + to_string(step) + "/3";'
+  on_register_step_done:
+    - lambda: |-
+        ESP_LOGI("lambda", "Register step %d done, finger_id=%d", step, finger_id);
+        if (step == 3) {
+          int uid = (finger_id - 1) / 3 + 1;
+          id(fp_status).publish_state("Отпечаток " + to_string((int) id(finger_index).state) + "/3 сохранён (пользователь ID " + to_string(uid) + ")");
+          if (id(finger_index).state < 3) {
+            id(finger_index).make_call().set_value(id(finger_index).state + 1).perform();
+          }
+        }
+  on_register_failed:
+    - script.execute: display_wake
+    - lambda: |-
+        ESP_LOGW("lambda", "Register failed, code %d", error_code);
+    - text_sensor.template.publish:
+        id: fp_status
+        state: "Error"
+    - script.execute: reset_status
+
+# ------------------------------------------------------------------ Сенсоры
+sensor:
+  - platform: hlk_fm22x
+    face_count:
+      id: face_count_sensor
+      name: "Face count"
+    last_face_id:
+      name: "Last face Id"
+    status:
+      name: "Face Module Status Code"
+
+binary_sensor:
+  - platform: hlk_fm22x
+    name: "Enrolling"
+
+text_sensor:
+  - platform: hlk_fm22x
+    last_face_name:
+      name: "Last Face Name"
+      id: last_face_name
+    version:
+      name: "Version"
+  - platform: template
+    name: "Enrollment Instruction"
+    id: enroll_instruction
+    icon: "mdi:face-recognition"
+  - platform: template
+    id: fp_status
+    name: "Status"
+    icon: mdi:fingerprint
+  - platform: template
+    id: selected_user_name
+    name: "Выбранный пользователь (имя)"
+    icon: mdi:account-check
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+      name: "IP Address"
+
+# ------------------------------------------------------------------ Кнопки
+button:
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
+  - platform: factory_reset
+    name: Reset
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Face scan"
+    id: id_scan_button
+    on_press:
+      then:
+        - lambda: 'id(last_face_name).publish_state("Сканирование...");'
+        - delay: 100ms
+        - hlk_fm22x.scan:
+
+  - platform: template
+    name: "Start Face Enrollment"
+    id: start_enroll_btn
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                const std::string &s = id(new_user_name).state;
+                if (s.empty()) return false;
+                for (unsigned char c : s) {
+                  if (c > 127 || c == ';' || c == '=') return false;
+                }
+                return true;
+            then:
+              - script.execute:
+                  id: start_enroll_script
+                  user_name: !lambda 'return id(new_user_name).state;'
+            else:
+              - lambda: 'id(enroll_instruction).publish_state("Ошибка: имя только латиницей, без русских букв, ; и =");'
+
+  - platform: template
+    name: "Delete Face User"
+    id: delete_user_btn
+    on_press:
+      then:
+        - hlk_fm22x.delete:
+            face_id: !lambda 'return (int) id(delete_user_id).state;'
+        - script.execute:
+            id: remove_face_name
+            fid: !lambda 'return (int) id(delete_user_id).state;'
+        # Удаляем и все 3 возможных слота отпечатков этого пользователя
+        # (формула: (id-1)*3 + 1/2/3). Если слот не был занят - сенсор
+        # просто ответит "не найдено", это безопасно игнорируется.
+        - fingerprint_sfm.delete: !lambda 'return (int) (((int) id(delete_user_id).state - 1) * 3 + 1);'
+        - fingerprint_sfm.delete: !lambda 'return (int) (((int) id(delete_user_id).state - 1) * 3 + 2);'
+        - fingerprint_sfm.delete: !lambda 'return (int) (((int) id(delete_user_id).state - 1) * 3 + 3);'
+        - lambda: |-
+            id(enroll_instruction).publish_state("Пользователь ID " + std::to_string((int) id(delete_user_id).state) + " и его отпечатки удалены");
+
+  - platform: template
+    name: "Fingerprint scan"
+    on_press:
+      then:
+        - fingerprint_sfm.start_scan
+  - platform: template
+    name: "Зарегистрировать отпечаток для пользователя"
+    id: register_finger_btn
+    on_press:
+      then:
+        - if:
+            condition:
+              # Проверяем, что выбранный ID действительно существует в face_names
+              lambda: |-
+                std::string map = id(face_names).state;
+                std::string key = std::to_string((int) id(target_user_id).state) + "=";
+                size_t pos = 0;
+                while (pos < map.size()) {
+                  size_t end = map.find(';', pos);
+                  if (end == std::string::npos) end = map.size();
+                  if (map.compare(pos, key.size(), key) == 0) return true;
+                  pos = end + 1;
+                }
+                return false;
+            then:
+              - text_sensor.template.publish:
+                  id: fp_status
+                  state: !lambda 'return "Палец " + to_string((int) id(finger_index).state) + "/3: приложите палец...";'
+              - fingerprint_sfm.start_register:
+                  finger_id: !lambda 'return (int) (((int) id(target_user_id).state - 1) * 3 + (int) id(finger_index).state);'
+            else:
+              - text_sensor.template.publish:
+                  id: fp_status
+                  state: "Ошибка: сначала зарегистрируйте лицо с этим ID (или выберите пользователя в select)"
+  - platform: template
+    name: "Fingerprint Yellow Green"
+    on_press:
+      then:
+        - fingerprint_sfm.set_color:
+            start: yellow
+            end: green
+            period: 2000ms
+            delay: 2000ms
+  - platform: template
+    name: "Fingerprint color from selects"
+    on_press:
+      then:
+        - lambda: |-
+            auto start = static_cast<fingerprint_sfm::SfmColor>(1 + id(color_start).active_index().value());
+            auto end = static_cast<fingerprint_sfm::SfmColor>(1 + id(color_end).active_index().value());
+            id(sfm_id).set_color(start, end);
+  - platform: template
+    name: "Delete fingerprint (advanced, raw ID 200)"
+    on_press:
+      then:
+        - fingerprint_sfm.delete: 200
+  - platform: template
+    name: "Delete all fingerprints"
+    on_press:
+      then:
+        - fingerprint_sfm.delete_all
+
+# ------------------------------------------------------------------ Дисплей
+output:
+  - platform: ledc
+    pin:
+      number: GPIO5
+    id: backlight_out
+
+light:
+  - platform: monochromatic
+    output: backlight_out
+    name: "Backlight"
+    id: backlight
+    restore_mode: ALWAYS_ON
+    on_turn_on:
+      - script.execute: display_autooff
+    on_turn_off:
+      - script.stop: display_autooff
+
+font:
+  # По умолчанию ESPHome грузит только ASCII-глифы - без явного списка
+  # кириллица рисуется как "заглушка" (пустые прямоугольники/палки).
+  # Указываем полный набор: латиница, цифры, пунктуация + вся кириллица.
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+    glyphs: |-
+      !"%'(),-.:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 22
+    glyphs: |-
+      !"%'(),-.:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя
+
+spi:
+  # На схеме подписаны как SCL/SDA (силкскрин модуля), по факту это SPI CLK/MOSI
+  clk_pin: GPIO41
+  mosi_pin: GPIO42
+
+display:
+  - platform: mipi_spi
+    model: ST7789V
+    dimensions:
+      height: 240
+      width: 240
+    # У модуля дисплея нет отдельного CS (посажен на GND на плате модуля).
+    # В mipi_spi (в отличие от ili9xxx) cs_pin опционален - просто не указываем.
+    # Без CS драйвер сам выбирает MODE3 - фиксируем явно, чтобы убрать
+    # предупреждение при компиляции. Если картинка на экране будет
+    # "битой"/со сдвигом - первое, что попробовать, это MODE0.
+    spi_mode: MODE3
+    dc_pin: GPIO14
+    reset_pin: GPIO4
+    invert_colors: true
+    update_interval: 500ms
+    lambda: |-
+      const int W = it.get_width();
+      it.fill(Color(0, 0, 0));
+
+      // Заголовок / часы (всегда)
+      it.filled_rectangle(0, 0, W, 26, Color(20, 40, 90));
+      if (id(sntp_time).now().is_valid())
+        it.strftime(W / 2, 4, id(font_small), Color(255, 255, 255), TextAlign::TOP_CENTER, "%H:%M:%S", id(sntp_time).now());
+      else
+        it.print(W / 2, 4, id(font_small), Color(255, 255, 255), TextAlign::TOP_CENTER, "Smart Door");
+
+      int icon_state = id(display_icon_state);
+      int cx = W / 2, cy = 130;
+      // Пульс 0..10 (треугольная волна) для "живых" иконок сканирования/ожидания
+      int t = millis() % 1000;
+      int pulse = (t < 500) ? (t / 50) : ((999 - t) / 50);
+
+      if (icon_state == 0) {
+        // ---------- Обычный дашборд ----------
+        std::string s = id(fp_status).state;
+        if (s.empty()) s = "Starting...";
+        Color c = Color(255, 255, 255);
+        if (s.rfind("Welcome", 0) == 0 || s.rfind("Добро", 0) == 0) c = Color(0, 220, 80);
+        else if (s.rfind("Error", 0) == 0 || s.find("не подходит") != std::string::npos || s.find("не распознан") != std::string::npos) c = Color(255, 60, 60);
+        it.filled_rectangle(10, 34, W - 20, 40, Color(25, 25, 25));
+        it.rectangle(10, 34, W - 20, 40, c);
+        it.print(W / 2, 54, id(font_small), c, TextAlign::CENTER, s.c_str());
+
+        std::string face = id(last_face_name).state;
+        if (face.empty()) face = "-";
+        it.printf(W / 2, 84, id(font_small), Color(160, 200, 255), TextAlign::TOP_CENTER, "Face: %s", face.c_str());
+
+        if (id(fp_count).has_state())
+          it.printf(W / 2, 108, id(font_small), Color(200, 200, 200), TextAlign::TOP_CENTER, "Fingerprints: %.0f", id(fp_count).state);
+        if (id(face_count_sensor).has_state())
+          it.printf(W / 2, 126, id(font_small), Color(200, 200, 200), TextAlign::TOP_CENTER, "Faces: %.0f", id(face_count_sensor).state);
+
+        it.printf(W / 2, 150, id(font_small), Color(220, 220, 220), TextAlign::TOP_CENTER, "Lock: %s",
+                  id(gimdow_ultra).state == lock::LOCK_STATE_LOCKED ? "locked" :
+                  id(gimdow_ultra).state == lock::LOCK_STATE_UNLOCKED ? "unlocked" : "unknown");
+
+        bool wifi_up = wifi::global_wifi_component->is_connected();
+        it.print(W / 2, 208, id(font_small), Color(160, 160, 160), TextAlign::TOP_CENTER, id(ip_addr).state.c_str());
+        it.print(W / 2, 226, id(font_small), wifi_up ? Color(0, 200, 80) : Color(255, 60, 60),
+                  TextAlign::TOP_CENTER, wifi_up ? "WiFi: connected" : "WiFi: offline");
+
+      } else if (icon_state == 1 || icon_state == 2) {
+        // ---------- Иконка лица (скан / найдено) ----------
+        Color ring = (icon_state == 1) ? Color(80, 160, 255) : Color(0, 220, 80);
+        if (icon_state == 1) it.circle(cx, cy, 42 + pulse / 2, ring);
+        it.filled_circle(cx, cy, 40, Color(35, 40, 55));
+        it.circle(cx, cy, 40, ring);
+        it.filled_circle(cx - 15, cy - 8, 5, Color(255, 255, 255));
+        it.filled_circle(cx + 15, cy - 8, 5, Color(255, 255, 255));
+        it.line(cx - 12, cy + 18, cx + 12, cy + 18, Color(255, 255, 255));
+        if (icon_state == 2) {
+          // Зелёный бейдж-галочка поверх лица
+          it.filled_circle(cx + 28, cy + 28, 14, Color(0, 180, 60));
+          it.line(cx + 22, cy + 28, cx + 27, cy + 34, Color(255, 255, 255));
+          it.line(cx + 27, cy + 34, cx + 36, cy + 20, Color(255, 255, 255));
+        }
+        it.print(W / 2, 190, id(font_small), Color(220, 220, 220), TextAlign::TOP_CENTER, id(fp_status).state.c_str());
+
+      } else if (icon_state == 3) {
+        // ---------- Иконка пальца/отпечатка (ждём касание) ----------
+        Color ring = Color(255, 200, 80);
+        it.circle(cx, cy, 44 + pulse / 2, ring);
+        it.filled_circle(cx, cy - 20, 20, Color(255, 205, 130));
+        it.filled_rectangle(cx - 20, cy - 20, 40, 55, Color(255, 205, 130));
+        it.circle(cx, cy + 5, 16, Color(150, 100, 40));
+        it.circle(cx, cy + 5, 10, Color(150, 100, 40));
+        it.circle(cx, cy + 5, 4, Color(150, 100, 40));
+        it.print(W / 2, 200, id(font_small), Color(255, 200, 80), TextAlign::TOP_CENTER, "Приложите палец");
+
+      } else if (icon_state == 4 || icon_state == 5) {
+        // ---------- Итог: галочка / крест ----------
+        Color col = (icon_state == 4) ? Color(0, 200, 70) : Color(220, 40, 40);
+        it.filled_circle(cx, cy, 46, col);
+        if (icon_state == 4) {
+          it.line(cx - 22, cy, cx - 5, cy + 20, Color(255, 255, 255));
+          it.line(cx - 5, cy + 20, cx + 26, cy - 18, Color(255, 255, 255));
+        } else {
+          it.line(cx - 20, cy - 20, cx + 20, cy + 20, Color(255, 255, 255));
+          it.line(cx - 20, cy + 20, cx + 20, cy - 20, Color(255, 255, 255));
+        }
+        it.print(W / 2, 200, id(font_small), col, TextAlign::TOP_CENTER, id(fp_status).state.c_str());
+      }

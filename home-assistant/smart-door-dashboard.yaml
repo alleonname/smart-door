@@ -1,0 +1,96 @@
+# ============================================================================
+# Smart Door — карточки в СТИЛЕ вашей рабочей карточки (type: entities,
+# без вложенных vertical-stack/markdown — чтобы точно так же вставлялось).
+#
+# КАК ДОБАВИТЬ (важно): НЕ дублируйте старую карточку и не вставляйте это
+# в её редактор — структура должна быть заменена целиком.
+# Правильно: на дашборде нажмите "+ Добавить карточку" -> внизу списка
+# "Вручную" (Manual) -> сотрите содержимое -> вставьте ОДИН блок ниже
+# целиком (от "type: entities" до конца этого блока) -> Сохранить.
+# Каждый блок ниже — отдельная карточка, добавляйте по одной.
+#
+# entity_id ниже — мой лучший расчёт по вашей же схеме транслитерации
+# (я->ia, ю->iu и т.д.), но 100% гарантии нет. Если какая-то строка
+# покажет "сущность не найдена" — Инструменты разработчика -> Состояния,
+# фильтр "smart_door", скопируйте точный entity_id и замените в этой строке.
+# ============================================================================
+
+# --- Карточка 1: Статус и замок ---
+type: entities
+title: Smart Door — статус
+entities:
+  - entity: sensor.smart_door_status_2  # текстовый статус (fp_status); из-за
+    # прежней коллизии имён в прошивке "_status" достался числовому сенсору
+    name: Статус
+  - entity: sensor.smart_door_last_face_name
+    name: Последнее распознанное лицо
+  - entity: sensor.smart_door_last_face_id
+    name: ID последнего лица
+  - entity: lock.smart_door_front_door_lock
+    name: Замок
+  - entity: sensor.smart_door_fingerprints_count
+    name: Отпечатков в базе
+  - entity: sensor.smart_door_face_count
+    name: Лиц в базе
+  - entity: binary_sensor.smart_door_enrolling
+    name: Идёт регистрация
+
+# --- Карточка 2: Регистрация лица (шаг 1) ---
+type: entities
+title: Smart Door — регистрация лица
+entities:
+  - entity: text.smart_door_imia_dlia_novogo_litsa
+    name: Имя для нового лица
+  - entity: button.smart_door_start_face_enrollment
+    name: Start Face Enrollment
+  - entity: sensor.smart_door_enrollment_instruction
+    name: Инструкция
+  - entity: button.smart_door_face_scan
+    name: Сканировать лицо сейчас
+
+# --- Карточка 3: Привязка отпечатка (шаг 2) ---
+type: entities
+title: Smart Door — привязка отпечатка
+entities:
+  - entity: select.smart_door_polzovatel_id_dlia_priviazki_otpechatka
+    name: Пользователь (ID)
+  - entity: number.smart_door_id_polzovatelia_dlia_otpechatka
+    name: ID пользователя (вручную)
+  - entity: number.smart_door_palets_polzovatelia_1_3
+    name: Палец (1-3)
+  - entity: sensor.smart_door_vybrannyi_polzovatel_imia
+    name: Выбранный пользователь
+  - entity: button.smart_door_zaregistrirovat_otpechatok_dlia_polzovatelia
+    name: Зарегистрировать отпечаток
+  - entity: button.smart_door_fingerprint_scan
+    name: Сканировать отпечаток вручную
+
+# --- Карточка 4: Управление пользователями ---
+type: entities
+title: Smart Door — пользователи
+entities:
+  - entity: text.smart_door_face_names
+    name: Таблица ID=имя
+  - entity: number.smart_door_id_dlia_udaleniia_litsa
+    name: ID для удаления
+  - entity: button.smart_door_delete_face_user
+    name: Удалить пользователя (лицо + отпечатки)
+
+# --- Карточка 5: Диагностика ---
+type: entities
+title: Smart Door — диагностика
+entities:
+  - entity: number.smart_door_display_timeout
+    name: Таймаут подсветки экрана
+  - entity: light.smart_door_backlight
+    name: Подсветка экрана
+  - entity: select.smart_door_color1_start
+    name: LED цвет (старт)
+  - entity: select.smart_door_color2_end
+    name: LED цвет (конец)
+  - entity: button.smart_door_delete_fingerprint_advanced_raw_id_200
+    name: "Advanced: удалить отпечаток raw ID 200"
+  - entity: button.smart_door_restart
+    name: Перезагрузить устройство
+  - entity: button.smart_door_reset
+    name: Factory reset
