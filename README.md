@@ -122,6 +122,17 @@ smart-door/
 - Шрифт требует явного списка `glyphs` с кириллицей — ESPHome по умолчанию
   грузит только ASCII.
 
+## 🙏 Благодарности
+
+Проект использует внешние компоненты ESPHome сторонних авторов:
+
+- [**gimdow_ble**](https://github.com/prokudin07/gimdow_ble) — компонент
+  для замка Gimdow A1 Ultra по BLE. Автор: [prokudin07](https://github.com/prokudin07).
+- [**esphome-components**](https://github.com/dvb6666/esphome-components)
+  (компонент `fingerprint_sfm` для сенсора SFM v1.7). Автор: [dvb6666](https://github.com/dvb6666).
+
+Спасибо авторам за проделанную работу — без этих компонентов проект был бы невозможен.
+
 ## 📄 Лицензия
 
 <!-- укажите лицензию по желанию, например MIT -->
