@@ -1003,6 +1003,17 @@ font:
     glyphs: |-
       !"%'(),-.:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя
 
+image:
+  # Неоновые иконки для экрана (оригинальные рисунки, не фото/не чужие
+  # файлы) - PNG на чёрном фоне, совпадающем с фоном экрана, поэтому без
+  # альфа-канала не видно "рамки" вокруг картинки.
+  - file: "images/fingerprint_icon.png"
+    id: fingerprint_icon
+    type: RGB565
+  - file: "images/face_icon.png"
+    id: face_icon
+    type: RGB565
+
 spi:
   # На схеме подписаны как SCL/SDA (силкскрин модуля), по факту это SPI CLK/MOSI
   clk_pin: GPIO41
@@ -1072,31 +1083,24 @@ display:
 
       } else if (icon_state == 1 || icon_state == 2) {
         // ---------- Иконка лица (скан / найдено) ----------
-        Color ring = (icon_state == 1) ? Color(80, 160, 255) : Color(0, 220, 80);
-        if (icon_state == 1) it.circle(cx, cy, 42 + pulse / 2, ring);
-        it.filled_circle(cx, cy, 40, Color(35, 40, 55));
-        it.circle(cx, cy, 40, ring);
-        it.filled_circle(cx - 15, cy - 8, 5, Color(255, 255, 255));
-        it.filled_circle(cx + 15, cy - 8, 5, Color(255, 255, 255));
-        it.line(cx - 12, cy + 18, cx + 12, cy + 18, Color(255, 255, 255));
+        // Лёгкое пульсирующее свечение позади картинки - только во время скана
+        if (icon_state == 1)
+          it.filled_circle(cx, cy - 10, 36 + pulse / 2, Color(0, (10 + pulse), (24 + pulse)));
+        it.image(cx - 50, cy - 60, id(face_icon));
         if (icon_state == 2) {
           // Зелёный бейдж-галочка поверх лица
-          it.filled_circle(cx + 28, cy + 28, 14, Color(0, 180, 60));
-          it.line(cx + 22, cy + 28, cx + 27, cy + 34, Color(255, 255, 255));
-          it.line(cx + 27, cy + 34, cx + 36, cy + 20, Color(255, 255, 255));
+          it.filled_circle(cx + 32, cy + 22, 14, Color(0, 180, 60));
+          it.line(cx + 26, cy + 22, cx + 31, cy + 28, Color(255, 255, 255));
+          it.line(cx + 31, cy + 28, cx + 40, cy + 14, Color(255, 255, 255));
         }
         it.print(W / 2, 190, id(font_small), Color(220, 220, 220), TextAlign::TOP_CENTER, id(fp_status).state.c_str());
 
       } else if (icon_state == 3) {
         // ---------- Иконка пальца/отпечатка (ждём касание) ----------
-        Color ring = Color(255, 200, 80);
-        it.circle(cx, cy, 44 + pulse / 2, ring);
-        it.filled_circle(cx, cy - 20, 20, Color(255, 205, 130));
-        it.filled_rectangle(cx - 20, cy - 20, 40, 55, Color(255, 205, 130));
-        it.circle(cx, cy + 5, 16, Color(150, 100, 40));
-        it.circle(cx, cy + 5, 10, Color(150, 100, 40));
-        it.circle(cx, cy + 5, 4, Color(150, 100, 40));
-        it.print(W / 2, 200, id(font_small), Color(255, 200, 80), TextAlign::TOP_CENTER, "Приложите палец");
+        // Лёгкое пульсирующее свечение позади картинки для "живости"
+        it.filled_circle(cx, cy - 8, 36 + pulse / 2, Color(0, (18 + pulse), (28 + pulse)));
+        it.image(cx - 50, cy - 66, id(fingerprint_icon));
+        it.print(W / 2, 200, id(font_small), Color(140, 220, 255), TextAlign::TOP_CENTER, "Приложите палец");
 
       } else if (icon_state == 4 || icon_state == 5) {
         // ---------- Итог: галочка / крест ----------
